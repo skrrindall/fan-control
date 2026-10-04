@@ -1,5 +1,6 @@
 use std::{fmt::Debug, rc::Rc};
 
+use nvml_wrapper::{Nvml, enum_wrappers::device::TemperatureSensor};
 use lm_sensors::{ChipRef, FeatureRef, LMSensors, SubFeatureRef, feature, value};
 use thiserror::Error;
 
@@ -14,6 +15,9 @@ static MANUAL_MODE: f64 = 1.0;
 
 pub struct LinuxBridge {
     lm_sensor: LinuxBridgeSelfRef,
+    nvml: Option<Nvml>,
+    nvidia_sensors: Vec<NvidiaSensor>,
+    lm_sensor_count: usize,
     hardware: Hardware,
 }
 
@@ -21,6 +25,15 @@ pub struct LinuxBridge {
 pub enum LinuxError {
     #[error("{0}: {1}")]
     LmSensors(String, lm_sensors::errors::Error),
+
+    #[error("NVML: {0}")]
+    NVML(#[from] nvml_wrapper::error::NvmlError),
+
+    #[error("NVML is not initialized")]
+    NvmlUnavailable,
+
+    #[error("NVIDIA sensor index {0} does not exist")]
+    InvalidNvidiaSensor(usize)
 }
 
 #[self_referencing]
@@ -50,6 +63,10 @@ struct PwmRefs<'a> {
 }
 struct SensorRefs<'a> {
     io: SubFeatureRef<'a>,
+}
+
+struct NvidiaSensor {
+    uuid: String,
 }
 
 enum InternalSubFeatureRef<'a> {
@@ -243,47 +260,129 @@ impl HardwareBridge for LinuxBridge {
             sensors_builder: |lib: &LMSensors| generate_hardware(lib, &mut hardware),
         }
         .build();
+        
+       let lm_sensor_count = bridge.with_sensors(|sensors| sensors.len());
 
-        Ok(Self {
-            lm_sensor: bridge,
-            hardware,
-        })
+        let mut nvidia_sensors = Vec::new();
+
+        let nvml = match Nvml::init() {
+            Ok(nvml) => {
+                match nvml.device_count() {
+                Ok(device_count) => {
+                    for index in 0..device_count {
+                        let Ok(device) = nvml.device_by_index(index) else {
+                            continue;
+                        };
+
+                        let Ok(uuid) = device.uuid() else {
+                            continue;
+                        };
+
+                        let name = device
+                            .name()
+                            .unwrap_or_else(|_| format!("NVIDIA GPU {index}"));
+
+                        let internal_index = lm_sensor_count + nvidia_sensors.len();
+
+                        hardware.temps.push(Rc::new(HSensor {
+                            name: format!("{name} GPU Temperature"),
+                            hardware_id: format!("nvidia-{uuid}-gpu-temp"),
+                            info: format!("NVIDIA GPU\nUUID: {uuid}"),
+                            internal_index,
+                        }));
+
+                        nvidia_sensors.push(NvidiaSensor { uuid });
+                    }
+                }
+                Err(e) => {
+                    error!("can't enumerate NVIDIA GPUs: {e}");
+                }
+            }
+
+            Some(nvml)
+        }
+        Err(e) => {
+            error!("can't initialize NVML: {e}");
+            None
+        }
+    };
+
+    Ok(Self {
+        lm_sensor: bridge,
+        nvml,
+        nvidia_sensors,
+        lm_sensor_count,
+        hardware,
+    })
+
     }
     fn hardware(&self) -> &Hardware {
         &self.hardware
     }
 
-    fn get_sensor_value(&mut self, sensor: &HSensor) -> crate::Result<Value> {
-        self.lm_sensor.with_sensors(|sensors| {
-            match sensors.get(sensor.internal_index).expect("no sensor found") {
-                InternalSubFeatureRef::Sensor(sensor_refs) => match sensor_refs.io.raw_value() {
-                    Ok(value) => Ok(value as i32),
-                    Err(e) => Err(HardwareError::Linux(LinuxError::LmSensors(
-                        "sensor".to_owned(),
-                        e,
-                    ))),
-                },
-                _ => unreachable!(),
-            }
-        })
-    }
-    fn get_control_value(&mut self, control: &HControl) -> crate::Result<Value> {
-        self.lm_sensor.with_sensors(|sensors| {
+fn get_sensor_value(&mut self, sensor: &HSensor) -> crate::Result<Value> {
+    if sensor.internal_index < self.lm_sensor_count {
+        return self.lm_sensor.with_sensors(|sensors| {
             match sensors
-                .get(control.internal_index)
+                .get(sensor.internal_index)
                 .expect("no sensor found")
             {
-                InternalSubFeatureRef::Pwm(pwm_refs) => match pwm_refs.io.raw_value() {
-                    Ok(value) => Ok((value / 2.55) as i32),
-                    Err(e) => Err(HardwareError::Linux(LinuxError::LmSensors(
-                        "pwm".to_owned(),
-                        e,
-                    ))),
-                },
+                InternalSubFeatureRef::Sensor(sensor_refs) => {
+                    match sensor_refs.io.raw_value() {
+                        Ok(value) => Ok(value as i32),
+                        Err(e) => Err(HardwareError::Linux(LinuxError::LmSensors(
+                            "sensor".to_owned(),
+                            e,
+                        ))),
+                    }
+                }
                 _ => unreachable!(),
             }
-        })
+        });
     }
+
+    let nvidia_index = sensor.internal_index - self.lm_sensor_count;
+
+    let nvidia_sensor = self
+        .nvidia_sensors
+        .get(nvidia_index)
+        .ok_or(HardwareError::Linux(
+            LinuxError::InvalidNvidiaSensor(nvidia_index),
+        ))?;
+
+    let nvml = self
+        .nvml
+        .as_ref()
+        .ok_or(HardwareError::Linux(LinuxError::NvmlUnavailable))?;
+
+    let device = nvml
+        .device_by_uuid(nvidia_sensor.uuid.as_str())
+        .map_err(LinuxError::NVML)?;
+
+    let temperature = device
+        .temperature(TemperatureSensor::Gpu)
+        .map_err(LinuxError::NVML)?;
+
+    Ok(temperature as i32)
+
+    }   
+        fn get_control_value(&mut self, control: &HControl) -> crate::Result<Value> {
+            self.lm_sensor.with_sensors(|sensors| {
+                match sensors
+                    .get(control.internal_index)
+                    .expect("no sensor found")
+                {
+                    InternalSubFeatureRef::Pwm(pwm_refs) => match pwm_refs.io.raw_value() {
+                        Ok(value) => Ok((value / 2.55) as i32),
+                        Err(e) => Err(HardwareError::Linux(LinuxError::LmSensors(
+                            "pwm".to_owned(),
+                            e,
+                        ))),
+                    },
+                    _=> unreachable!(),
+                }
+            })
+        }
 
     fn set_value(&mut self, control: &HControl, value: Value) -> crate::Result<()> {
         self.lm_sensor.with_sensors(|sensors| {
@@ -328,5 +427,13 @@ impl HardwareBridge for LinuxBridge {
                 _ => unreachable!(),
             }
         })
+    }
+    
+    fn update(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+    
+    fn shutdown(&mut self) -> crate::Result<()> {
+        Ok(())
     }
 }

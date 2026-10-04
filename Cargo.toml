@@ -51,6 +51,7 @@ hardware = { path = "hardware" }
 data = { path = "data" }
 ui = { path = "ui" }
 common = { path = "common" }
+nvml-wrapper = "0.13.0"
 
 clap = { version = "4", features = ["derive", "string"] }
 serde = { version = "1", features = ["derive", "rc"] }
